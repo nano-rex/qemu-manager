@@ -54,7 +54,9 @@ qemu-manager boot -qcow2 VM.qcow2
 
 Install Windows 11. Setup checks for Secure Boot, TPM 2.0, 4 GB RAM, 2 CPUs and a 64 GB
 disk, so create a disk of at least 64 GB and boot with `-secureboot -tpm -memory 4G -smp 2`.
-Press a key when asked to boot from CD. Keep the same flags on every later boot, because
+Click into the VM window and press a key when asked to boot from CD. If you miss it, press a
+key at "Press any key to enter the Boot Manager Menu" and pick the DVD drive. Keep the same
+flags on every later boot, because
 Windows ties its data to that TPM and UEFI state:
 
 ```bash

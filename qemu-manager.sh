@@ -185,11 +185,23 @@ else
 fi
 shopt -u nocasematch
 args=(-enable-kvm -cpu host)
-args+=(-drive "file=$target,format=$disk_format,index=0,media=disk")
 
+# Boot order: CD first when an ISO is given, then the disk. bootindex works for both
+# BIOS and UEFI (UEFI ignores -boot d).
+args+=(
+  -drive "if=none,id=hd0,file=$target,format=$disk_format"
+  -device ide-hd,drive=hd0,bus=ide.0,bootindex=1
+)
 if [[ -n $iso_file ]]; then
-  args+=(-boot d -cdrom "$iso_file")
+  args+=(
+    -drive "if=none,id=cd0,file=$iso_file,format=raw,media=cdrom,readonly=on"
+    -device ide-cd,drive=cd0,bus=ide.1,bootindex=0
+  )
 fi
+
+# No network boot (PXE): without it, a missed "Press any key to boot from CD" falls
+# through to the disk instead of minutes of "Start PXE over IPv4". Networking still works.
+args+=(-global e1000e.romfile= -global e1000.romfile= -global virtio-net-pci.romfile=)
 
 # Per-VM state (TPM, UEFI vars) lives next to the disk, e.g. vm.qcow2 -> vm.vmstate/
 if [[ $target == /dev/* ]]; then
