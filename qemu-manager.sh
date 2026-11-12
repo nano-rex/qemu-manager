@@ -41,9 +41,89 @@ uefi_test="/home/user/github/coreboot-rust/bin/qemu_i440fx_8mb/qemu_i440fx_8mb.f
 ovmf_code_secboot="/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
 ovmf_vars_ms="/usr/share/OVMF/OVMF_VARS_4M.ms.fd"  # Microsoft Secure Boot keys enrolled
 
+# DEVICE PASSTHROUGH (-pci, -usb; list devices with qemu-devices.sh)
+sys="/sys"  # sysfs root
+pci_devs=()
+usb_devs=()
+
 die() {
   echo "Error: $*" >&2
   exit 1
+}
+
+# --- PCI passthrough helpers (same rules as qemu-devices.sh) ---
+
+# Full PCI address: 00:14.3 -> 0000:00:14.3
+pci_full_addr() {
+  local a="${1,,}"
+  [[ $a =~ ^[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] && a="0000:$a"
+  echo "$a"
+}
+
+# sysfs paths of the disks holding the root filesystem
+root_disk_paths() {
+  local src disk type
+  src=$(findmnt -no SOURCE / 2>/dev/null) || return
+  lsblk -nrso NAME,TYPE "$src" 2>/dev/null | while read -r disk type; do
+    [[ $type == disk ]] && readlink -f "$sys/block/$disk"
+  done
+}
+
+# Why a PCI device must never be detached from the host (empty if it may be)
+pci_blocker() {
+  local addr="$1" dev="$sys/bus/pci/devices/$1"
+  if [[ $(cat "$dev/class") == 0x06* ]]; then
+    echo "bridge"
+  elif [[ $(cat "$dev/boot_vga" 2>/dev/null) == 1 ]]; then
+    echo "host display"
+  elif grep -q "/$addr/" <<< "$root_disks"; then
+    echo "host system disk"
+  fi
+}
+
+# Why a PCI device can't be attached: a hard blocker, or a platform device a VM has no use for
+pci_unattachable() {
+  local blocker
+  blocker=$(pci_blocker "$1")
+  if [[ -n $blocker ]]; then
+    echo "$blocker"
+    return
+  fi
+  case $(cat "$sys/bus/pci/devices/$1/class") in
+    0x01*|0x02*|0x03*|0x04*|0x0c03*|0x0805*|0x0d*|0x12*) ;;
+    *) echo "system device" ;;
+  esac
+}
+
+# Detach a PCI device from its host driver and bind it to vfio-pci, remembering the
+# original driver so restore_pci can give it back when the VM exits
+pci_restore=()
+bind_vfio() {
+  local addr="$1" dev="$sys/bus/pci/devices/$1" drv
+  drv=$(basename "$(readlink "$dev/driver")" 2>/dev/null)
+  [[ $drv == vfio-pci ]] && return 0  # already bound, by the user or earlier in this run
+  pci_restore+=("$addr|$drv")
+  echo vfio-pci > "$dev/driver_override" || die "could not prepare $addr for vfio-pci."
+  if [[ -n $drv ]]; then
+    echo "$addr" > "$dev/driver/unbind" || die "could not detach $addr from $drv."
+  fi
+  echo "$addr" > "$sys/bus/pci/drivers_probe"
+  drv_now=$(basename "$(readlink "$dev/driver")" 2>/dev/null)
+  [[ $drv_now == vfio-pci ]] || die "could not bind $addr to vfio-pci."
+  echo "Detached ${addr#0000:} from the host (was: ${drv:-no driver})."
+}
+
+# Give every device bind_vfio detached back to its original host driver
+restore_pci() {
+  local entry addr drv
+  for entry in "${pci_restore[@]}"; do
+    addr="${entry%%|*}"
+    drv="${entry#*|}"
+    echo "$addr" > "$sys/bus/pci/drivers/vfio-pci/unbind" 2> /dev/null
+    echo > "$sys/bus/pci/devices/$addr/driver_override"  # a bare newline clears it
+    echo "$addr" > "$sys/bus/pci/drivers_probe" 2> /dev/null
+    echo "Returned ${addr#0000:} to the host (${drv:-no driver})."
+  done
 }
 
 usage() {
@@ -67,6 +147,11 @@ usage() {
   printf "  -sound           Enable sound output (PulseAudio/PipeWire).\n"
   printf "  -share TYPE      Share %s with the guest: '9p' or 'samba'.\n" "$shared_folder"
   printf "  -display TYPE    Display type: 'gtk' (default) or 'spice'.\n"
+  printf "  -pci ADDR        Attach a host PCI device, e.g. -pci 00:14.3 (needs sudo). It is detached\n"
+  printf "                   from the host while the VM runs, then given back. Repeat for more devices.\n"
+  printf "  -usb ID          Attach a host USB device by VENDOR:PRODUCT (e.g. 0951:1666) or by port\n"
+  printf "                   (e.g. 3-1). Repeat for more devices. Usually needs sudo.\n"
+  printf "                   List devices and their -pci/-usb values with: qemu-devices.sh\n"
   printf "\nA disk image or ISO can also be given without a flag: %s boot vm.qcow2 os.iso\n" "$0"
   printf "\nWINDOWS 11:\n"
   printf "  Windows 11 setup checks for Secure Boot, TPM 2.0, 4G memory, 2 CPUs and a 64G disk.\n"
@@ -92,7 +177,7 @@ set_command() {
 while [[ $# -gt 0 ]]; do
   opt="$1"
   case $opt in
-    -qcow2|-disk|-iso|-memory|-smp|-share|-display)
+    -qcow2|-disk|-iso|-memory|-smp|-share|-display|-pci|-usb)
       # These flags take a value: it must exist and must not be another flag
       if [[ $# -lt 2 || $2 == -* ]]; then
         die "$opt needs a value (see --help)."
@@ -105,6 +190,8 @@ while [[ $# -gt 0 ]]; do
         -iso)     iso_file="$value" ;;
         -memory)  memory="$value" ;;
         -smp)     smp="$value" ;;
+        -pci)     pci_devs+=("$value") ;;
+        -usb)     usb_devs+=("$value") ;;
         -share)
           case $value in
             9p|samba) share_type="$value" ;;
@@ -208,6 +295,66 @@ fi
 # No network boot (PXE): without it, a missed "Press any key to boot from CD" falls
 # through to the disk instead of minutes of "Start PXE over IPv4". Networking still works.
 args+=(-global e1000e.romfile= -global e1000.romfile= -global virtio-net-pci.romfile=)
+
+# USB passthrough: each device on its own guest xHCI controller port
+if [[ ${#usb_devs[@]} -gt 0 ]]; then
+  args+=(-device qemu-xhci,id=usbpass)
+  for u in "${usb_devs[@]}"; do
+    if [[ $u =~ ^([0-9a-fA-F]{4}):([0-9a-fA-F]{4})$ ]]; then
+      vid="${BASH_REMATCH[1],,}"
+      pid="${BASH_REMATCH[2],,}"
+      matches=()
+      for d in "$sys"/bus/usb/devices/*; do
+        [[ -f $d/idVendor && $(cat "$d/idVendor") == "$vid" && $(cat "$d/idProduct") == "$pid" ]] && matches+=("$d")
+      done
+      [[ ${#matches[@]} -gt 0 ]] || die "USB device $u is not plugged in (list devices with qemu-devices.sh usb)."
+      [[ ${#matches[@]} -eq 1 ]] || die "${#matches[@]} USB devices have ID $u; attach one by port instead (see qemu-devices.sh usb)."
+      usb_dev="${matches[0]}"
+      args+=(-device "usb-host,bus=usbpass.0,vendorid=0x$vid,productid=0x$pid")
+    elif [[ $u =~ ^([0-9]+)-([0-9.]+)$ ]]; then
+      usb_dev="$sys/bus/usb/devices/$u"
+      [[ -f $usb_dev/idVendor ]] || die "no USB device at port $u (list devices with qemu-devices.sh usb)."
+      args+=(-device "usb-host,bus=usbpass.0,hostbus=${BASH_REMATCH[1]},hostport=${BASH_REMATCH[2]}")
+    else
+      die "-usb takes VENDOR:PRODUCT (e.g. 0951:1666) or a port (e.g. 3-1), got '$u'."
+    fi
+    node=$(printf "/dev/bus/usb/%03d/%03d" "$(cat "$usb_dev/busnum")" "$(cat "$usb_dev/devnum")")
+    [[ -w $node ]] || die "no permission to use USB device $u ($node); run with sudo."
+  done
+fi
+
+# PCI passthrough (VFIO): detach each device, and the rest of its IOMMU group, from the
+# host; restore_pci gives them back when the script exits, however it exits
+if [[ ${#pci_devs[@]} -gt 0 ]]; then
+  [[ $EUID -eq 0 ]] || die "-pci needs root to detach devices from the host; run with sudo."
+  [[ -n $(ls -A "$sys/kernel/iommu_groups" 2> /dev/null) ]] ||
+    die "the IOMMU is off. Add intel_iommu=on (Intel) or amd_iommu=on (AMD) to the kernel command line and reboot."
+  modprobe vfio-pci || die "could not load the vfio-pci kernel module."
+  root_disks=$(root_disk_paths)
+  trap restore_pci EXIT
+  attached=()
+  for a in "${pci_devs[@]}"; do
+    addr=$(pci_full_addr "$a")
+    pci_dev="$sys/bus/pci/devices/$addr"
+    [[ -e $pci_dev ]] || die "no PCI device $a (list devices with qemu-devices.sh pci)."
+    [[ " ${attached[*]} " == *" $addr "* ]] && continue  # given twice
+    reason=$(pci_unattachable "$addr")
+    [[ -z $reason ]] || die "PCI device $a can't be attached: $reason."
+    group=$(basename "$(readlink "$pci_dev/iommu_group")")
+    for m in "$sys/kernel/iommu_groups/$group/devices"/*; do
+      m="${m##*/}"
+      reason=$(pci_blocker "$m")
+      [[ $reason == bridge ]] && continue
+      [[ -z $reason ]] || die "PCI device $a shares IOMMU group $group with ${m#0000:} ($reason), which must stay with the host."
+    done
+    for m in "$sys/kernel/iommu_groups/$group/devices"/*; do
+      m="${m##*/}"
+      [[ $(pci_blocker "$m") == bridge ]] || bind_vfio "$m"
+    done
+    attached+=("$addr")
+    args+=(-device "vfio-pci,host=$addr")
+  done
+fi
 
 # Per-VM state (TPM, UEFI vars) lives next to the disk, e.g. vm.qcow2 -> vm.vmstate/
 if [[ $target == /dev/* ]]; then

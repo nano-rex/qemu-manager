@@ -15,6 +15,9 @@ Quickly create and run QEMU/KVM virtual machines from the terminal, without writ
 - `-secureboot` and `-tpm` keep the VM's UEFI settings and TPM state in `<disk>.vmstate/`
   next to the disk, so keep that folder with the image.
 - `-share 9p` shares `~/Public` with the guest over virtio-9p (mount tag `hostshare`).
+- `-usb ID` attaches a host USB device (by `VENDOR:PRODUCT` or port), and `-pci ADDR`
+  attaches a host PCI device such as a Wi-Fi card or USB controller. `qemu-devices.sh`
+  lists the devices you can attach and the flag to use for each.
 
 ## Install
 
@@ -27,6 +30,7 @@ nothing to build:
 git clone https://github.com/nano-rex/qemu-manager.git
 cd qemu-manager
 sudo install -m 755 qemu-manager.sh /usr/local/bin/qemu-manager
+sudo install -m 755 qemu-devices.sh /usr/local/bin/qemu-devices
 ```
 
 `qemu-manager.ps1` is an unfinished Windows draft: it calls `New-QemuDisk` /
@@ -71,6 +75,22 @@ another machine. Pass the whole disk, not a partition (`sdb`, not `sdb1`):
 ```bash
 sudo qemu-manager boot -disk /dev/sdb
 ```
+
+Attach host devices. List them first; the `ATTACH` column gives the flag to use, or why a
+device can't be attached (the host's display, system disk, bridges and internal platform
+devices are refused):
+
+```bash
+qemu-devices                # PCI and USB devices
+sudo qemu-manager boot -qcow2 VM.qcow2 -usb 0951:1666 -pci 00:14.3
+```
+
+- `-usb` takes `VENDOR:PRODUCT`, or the port (e.g. `3-1`) when two devices share an ID.
+  It needs `sudo` unless your user can write to the device under `/dev/bus/usb`.
+- `-pci` needs `sudo` and the IOMMU (`intel_iommu=on` / `amd_iommu=on` if it's off). The
+  device, and any other device in its IOMMU group, is detached from the host while the VM
+  runs and given back to its driver when the VM exits. Attaching a USB controller takes
+  every USB device on it away from the host; `qemu-devices` lists them.
 
 Inside a Linux guest booted with `-share 9p`, mount the shared `~/Public` folder:
 
