@@ -7,20 +7,28 @@ Quickly create and run QEMU/KVM virtual machines from the terminal, without writ
   and VMs with host USB/PCI devices attached.
 - `qemu-devices.sh` lists the host's PCI and USB devices and the flag to attach each one.
 
-## Install
+## Setup
 
-Requires QEMU with KVM (Debian/Ubuntu: `sudo apt install qemu-system-x86 qemu-utils`;
-Arch: `sudo pacman -S qemu-full`). Optional, per feature:
+### 1. Packages
 
-| Package | Needed for |
+QEMU with KVM is required (Debian/Ubuntu: `sudo apt install qemu-system-x86 qemu-utils`;
+Arch: `sudo pacman -S qemu-full`). The rest depends on the features you use:
+
+| Package (Debian/Ubuntu) | Needed for |
 |---|---|
-| `ovmf` | `-secureboot`, `-uefi` |
-| `swtpm` | `-tpm` |
+| `ovmf` | `-uefi`, `-secureboot` (UEFI firmware) |
+| `swtpm` | `-tpm` (TPM 2.0 emulator) |
 | `python3` | pressing "any key" at an ISO's boot prompt for you |
-| `pciutils` (`lspci`) | readable device names in `qemu-devices` |
-| `virt-viewer` | `-display spice` with `qemu-manager view` |
+| `pciutils` | readable PCI device names in `qemu-devices` (`lspci`) |
+| `samba` | `-share samba` |
+| `virt-viewer` | `-display spice` with `qemu-manager view` (`remote-viewer`) |
 
-Your user must be in the `kvm` group (`sudo usermod -aG kvm $USER`, then log out and in).
+```bash
+sudo apt install qemu-system-x86 qemu-utils ovmf swtpm python3 pciutils
+```
+
+### 2. Install the scripts
+
 There's nothing to build:
 
 ```bash
@@ -32,6 +40,59 @@ sudo install -m 755 qemu-devices.sh /usr/local/bin/qemu-devices
 
 The examples below use the installed names. Without installing, run `./qemu-manager.sh`
 and `./qemu-devices.sh` from the repository folder instead.
+
+### 3. Permissions
+
+Most VMs run as your normal user. Check each item for the features you use.
+
+**KVM (every VM).** `/dev/kvm` belongs to the `kvm` group:
+
+```bash
+sudo usermod -aG kvm $USER     # then log out and back in
+groups | grep -w kvm           # check: should print a line containing kvm
+```
+
+**UEFI firmware (`-uefi`, `-secureboot`).** The firmware files only need to be readable,
+which they are after installing `ovmf` (`ls -l /usr/share/OVMF/`). The script never writes
+to them: each VM gets its own copy of the UEFI settings in `<disk>.vmstate/`. The paths are
+set at the top of `qemu-manager.sh` (`ovmf_code`, `ovmf_vars`, `ovmf_code_secboot`,
+`ovmf_vars_ms`) and are Debian/Ubuntu's; on other distributions, point them at your
+`OVMF_CODE` / `OVMF_VARS` files (Arch: `/usr/share/edk2/x64/`).
+
+**TPM (`-tpm`) and the `.vmstate` folder.** `swtpm` runs as you and stores its state in
+`<disk>.vmstate/`, created next to the disk image, so you need write access to the disk's
+folder. If a VM was once started with `sudo`, that folder belongs to root and later runs
+without `sudo` fail; give it back with:
+
+```bash
+sudo chown -R $USER: VM.qcow2 VM.vmstate
+```
+
+**USB devices (`-usb`).** QEMU needs write access to the device under `/dev/bus/usb`, which
+only root has by default. Either run with `sudo`, or allow your user for a specific device
+with a udev rule (use the ID that `qemu-devices usb` shows, here `0951:1666`):
+
+```bash
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="0951", ATTR{idProduct}=="1666", MODE="0660", GROUP="plugdev"' |
+  sudo tee /etc/udev/rules.d/50-qemu-usb.rules
+sudo udevadm control --reload && sudo udevadm trigger   # then unplug and replug the device
+```
+
+Your user must be in the `plugdev` group (`groups`; add with `sudo usermod -aG plugdev $USER`).
+
+**PCI devices (`-pci`).** Always needs `sudo`: the script detaches the device from its
+host driver, which only root may do. The IOMMU must also be on; `qemu-devices` says so in
+its first line. If it's off, add `intel_iommu=on` (Intel) or `amd_iommu=on` (AMD) to the
+kernel command line. On Debian/Ubuntu with GRUB:
+
+```bash
+sudo nano /etc/default/grub    # append to GRUB_CMDLINE_LINUX_DEFAULT: intel_iommu=on iommu=pt
+sudo update-grub && sudo reboot
+```
+
+**Running with `sudo`.** `sudo` changes `$HOME` to `/root`, so `-share` then shares
+`/root/Public`, and `-sound` can't reach your user's sound server. Only use `sudo` for
+`-pci`, `-usb` (without a udev rule) and `-disk`.
 
 `qemu-manager.ps1` is an unfinished Windows draft: it calls `New-QemuDisk` /
 `Start-QemuSystem`, which aren't shipped with QEMU, so use the Linux script.
@@ -74,6 +135,7 @@ option stops with an error instead of being ignored.
 | `-secureboot` | Secure Boot UEFI firmware (Microsoft keys) on a q35 machine. |
 | `-tpm` | Emulated TPM 2.0 chip. |
 | `-uefi` | Plain UEFI firmware, without Secure Boot. |
+| `-test` | Developer option: boots a custom firmware image (path set in the script). |
 | `-sound` | Sound output through PulseAudio/PipeWire. |
 | `-share 9p\|samba` | Shares `~/Public` with the guest (see [Shared folder](#shared-folder)). |
 | `-display gtk\|spice` | VM window (`gtk`, default) or a SPICE server for `qemu-manager view`. |
@@ -85,10 +147,10 @@ A disk image and an ISO can also be given without flags:
 
 After the VM shuts down, the script prints the exact `qemu-system-x86_64` command it ran.
 
-`-secureboot` and `-tpm` keep the VM's UEFI settings and TPM state in a folder next to the
-disk (`VM.qcow2` → `VM.vmstate/`; for a physical disk, under
+`-uefi`, `-secureboot` and `-tpm` keep the VM's UEFI settings and TPM state in a folder next
+to the disk (`VM.qcow2` → `VM.vmstate/`; for a physical disk, under
 `~/.local/share/qemu-manager/`). Keep that folder with the image and keep using the same
-flags, or the guest loses its TPM data (BitLocker keys, Windows Hello).
+flags, or the guest loses its UEFI boot entries and TPM data (such as BitLocker keys).
 
 ### qemu-devices
 
@@ -193,7 +255,8 @@ Add `-uefi` if the OS on it was installed in UEFI mode.
 
 ### Shared folder
 
-`-share 9p` shares `~/Public`. Inside a Linux guest, mount it with:
+`-share 9p` shares `~/Public` (created if it doesn't exist). Inside a Linux guest, mount
+it with:
 
 ```bash
 sudo mount -t 9p -o trans=virtio hostshare /mnt
@@ -234,6 +297,9 @@ or a previous run left `swtpm` behind. Close the other VM, or end it with
 `pkill -f '<name>.vmstate/tpm'`.
 
 **Keys do nothing in Windows Setup**: click inside the VM window first, so it has focus.
+
+**"Permission denied" on a `.vmstate` file, or "no permission to use USB device"**: see
+[Permissions](#3-permissions).
 
 ## License
 

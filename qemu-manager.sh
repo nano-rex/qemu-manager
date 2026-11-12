@@ -33,8 +33,10 @@ display=("${display_gtk[@]}")  # Default display type if not defined
 sound_pa=(-device ich9-intel-hda -device hda-output,audiodev=pa -audiodev "pa,id=pa,server=unix:${XDG_RUNTIME_DIR}/pulse/native")
 sound=()  # Default to no sound
 
-# UEFI FIRMWARE
-uefi_plain="/usr/share/qemu/OVMF.fd"
+# UEFI FIRMWARE (-uefi). Firmware paths differ per distro; Arch: /usr/share/edk2/x64/OVMF_CODE.4m.fd
+# and OVMF_VARS.4m.fd (secure boot: OVMF_CODE.secboot.4m.fd, and enroll keys yourself).
+ovmf_code="/usr/share/OVMF/OVMF_CODE_4M.fd"
+ovmf_vars="/usr/share/OVMF/OVMF_VARS_4M.fd"
 uefi_test="/home/user/github/coreboot-rust/bin/qemu_i440fx_8mb/qemu_i440fx_8mb.flash.bin"
 
 # SECURE BOOT UEFI FIRMWARE (-secureboot)
@@ -143,7 +145,7 @@ usage() {
   printf "  -tpm             Attach an emulated TPM 2.0 chip (needs swtpm).\n"
   printf "  -secureboot      Boot with Secure Boot UEFI (Microsoft keys) on a q35 machine (needs ovmf).\n"
   printf "  -uefi            Boot with plain (non-Secure Boot) UEFI firmware.\n"
-  printf "                   -tpm and -secureboot keep their state in <disk>.vmstate/ next to the disk.\n"
+  printf "                   -tpm, -secureboot and -uefi keep their state in <disk>.vmstate/ next to the disk.\n"
   printf "  -sound           Enable sound output (PulseAudio/PipeWire).\n"
   printf "  -share TYPE      Share %s with the guest: '9p' or 'samba'.\n" "$shared_folder"
   printf "  -display TYPE    Display type: 'gtk' (default) or 'spice'.\n"
@@ -210,7 +212,7 @@ while [[ $# -gt 0 ]]; do
     -secureboot) secureboot=1; shift ;;
     -tpm)    tpm=1; shift ;;
     -sound)  sound=("${sound_pa[@]}"); shift ;;
-    -uefi)   uefi_file="$uefi_plain"; shift ;;
+    -uefi)   uefi=1; shift ;;
     -test)   uefi_file="$uefi_test"; shift ;;
     boot|create)        set_command "$opt"; shift ;;
     view|client)        set_command view; shift ;;
@@ -367,7 +369,7 @@ fi
 
 # Secure Boot: q35 with SMM (required by the firmware), Secure Boot OVMF and per-VM UEFI vars
 if [[ $secureboot == 1 ]]; then
-  [[ -z $uefi_file ]] || die "use either -secureboot or -uefi/-test, not both."
+  [[ -z $uefi_file && $uefi != 1 ]] || die "use either -secureboot or -uefi/-test, not both."
   for f in "$ovmf_code_secboot" "$ovmf_vars_ms"; do
     [[ -f $f ]] || die "$f not found (Debian/Ubuntu: sudo apt install ovmf)."
   done
@@ -381,6 +383,23 @@ if [[ $secureboot == 1 ]]; then
     -global driver=cfi.pflash01,property=secure,value=on
     -drive "if=pflash,format=raw,unit=0,file=$ovmf_code_secboot,readonly=on"
     -drive "if=pflash,format=raw,unit=1,file=$state_dir/vars.fd"
+  )
+fi
+
+# Plain UEFI: read-only firmware plus this VM's own copy of the UEFI settings, so no system
+# file has to be writable (uefi-vars.fd; vars.fd belongs to -secureboot)
+if [[ $uefi == 1 ]]; then
+  [[ -z $uefi_file ]] || die "use either -uefi or -test, not both."
+  for f in "$ovmf_code" "$ovmf_vars"; do
+    [[ -f $f ]] || die "$f not found (Debian/Ubuntu: sudo apt install ovmf)."
+  done
+  mkdir -p "$state_dir" || exit 1
+  if [[ ! -f $state_dir/uefi-vars.fd ]]; then
+    cp "$ovmf_vars" "$state_dir/uefi-vars.fd" || exit 1
+  fi
+  args+=(
+    -drive "if=pflash,format=raw,unit=0,file=$ovmf_code,readonly=on"
+    -drive "if=pflash,format=raw,unit=1,file=$state_dir/uefi-vars.fd"
   )
 fi
 
@@ -408,6 +427,9 @@ args+=(-m "$memory")
 [[ -n $smp ]] && args+=(-smp "$smp")
 args+=("${display[@]}" "${sound[@]}")
 
+if [[ -n $share_type ]]; then
+  mkdir -p "$shared_folder" || die "could not create the shared folder $shared_folder."
+fi
 case $share_type in
   9p)
     args+=(
