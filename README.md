@@ -10,15 +10,16 @@ Quickly create and run QEMU/KVM virtual machines from the terminal, without writ
   disk with `-disk /dev/sdb`, optionally with an installer ISO attached as a CD-ROM.
 - Every VM runs with KVM acceleration and the host CPU model. Memory defaults to 2 GB
   (`-memory 4G` to change it), CPUs to 1 (`-smp 4`).
-- `-win11` meets the Windows 11 requirements: q35 machine, Secure Boot UEFI with Microsoft
-  keys, an emulated TPM 2.0 (swtpm), 4 GB RAM and 4 CPUs. The VM's UEFI settings and TPM
-  state are kept in `<disk>.win11/` next to the disk, so keep that folder with the image.
+- `-secureboot` boots with Secure Boot UEFI firmware (Microsoft keys) on a q35 machine.
+- `-tpm` attaches an emulated TPM 2.0 chip (swtpm).
+- `-secureboot` and `-tpm` keep the VM's UEFI settings and TPM state in `<disk>.vmstate/`
+  next to the disk, so keep that folder with the image.
 - `-share 9p` shares `~/Public` with the guest over virtio-9p (mount tag `hostshare`).
 
 ## Install
 
 Requires QEMU with KVM (Debian/Ubuntu: `sudo apt install qemu-system-x86 qemu-utils`;
-Arch: `sudo pacman -S qemu-full`). For `-win11` also install `ovmf` and `swtpm`. Your user
+Arch: `sudo pacman -S qemu-full`). `-secureboot` needs `ovmf` and `-tpm` needs `swtpm`. Your user
 needs to be in the `kvm` group (`sudo usermod -aG kvm $USER`, then log in again). There's
 nothing to build:
 
@@ -51,12 +52,14 @@ Run it afterwards:
 qemu-manager boot -qcow2 VM.qcow2
 ```
 
-Install Windows 11 (create a disk of at least 64 GB first). Press a key when asked to boot
-from CD, then keep passing `-win11` on every later boot:
+Install Windows 11. Setup checks for Secure Boot, TPM 2.0, 4 GB RAM, 2 CPUs and a 64 GB
+disk, so create a disk of at least 64 GB and boot with `-secureboot -tpm -memory 4G -smp 2`.
+Press a key when asked to boot from CD. Keep the same flags on every later boot, because
+Windows ties its data to that TPM and UEFI state:
 
 ```bash
-qemu-manager boot -win11 -qcow2 win11.qcow2 -iso Win11_English_x64.iso
-qemu-manager boot -win11 -qcow2 win11.qcow2
+qemu-manager boot -qcow2 win11.qcow2 -iso Win11_English_x64.iso -secureboot -tpm -memory 4G -smp 2
+qemu-manager boot -qcow2 win11.qcow2 -secureboot -tpm -memory 4G -smp 2
 ```
 
 Boot an external disk as a VM, for example to troubleshoot an OS that won't start on
