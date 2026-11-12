@@ -10,6 +10,11 @@ memory="2G"  # Default memory if not defined
 # SHARED FOLDER
 shared_folder="$HOME/Public"  # Default shared folder if not defined
 
+# CD BOOT KEY
+# Windows ISOs only boot after "Press any key to boot from CD or DVD". When an ISO is
+# attached, Enter is pressed for this many seconds after start (0 turns it off).
+iso_keypress_seconds=10
+
 # DISPLAY CLIENT
 display_gtk=(-display gtk)
 display_spice=(
@@ -51,7 +56,8 @@ usage() {
   printf "\nOPTIONS (for boot):\n"
   printf "  -qcow2 FILE      Disk image to boot (.qcow2, or a raw image such as .img).\n"
   printf "  -disk DEVICE     Physical disk to boot (e.g., /dev/sdb).\n"
-  printf "  -iso FILE        ISO image to boot from (attached as a CD-ROM).\n"
+  printf "  -iso FILE        ISO image to boot from (attached as a CD-ROM). Enter is pressed for the\n"
+  printf "                   first %ss to get past \"Press any key to boot from CD\" (needs python3).\n" "$iso_keypress_seconds"
   printf "  -memory SIZE     Memory size (default: 2G). Example: 4G, 1024M.\n"
   printf "  -smp N           Number of virtual CPUs (default: 1).\n"
   printf "  -tpm             Attach an emulated TPM 2.0 chip (needs swtpm).\n"
@@ -267,9 +273,50 @@ case $share_type in
     ;;
 esac
 
+# Press Enter through the "Press any key to boot from CD or DVD" prompt, over QMP
+# (a control socket, so the GTK window's own monitor stays as it is). Needs python3.
+qmp_dir=""
+if [[ -n $iso_file && $iso_keypress_seconds -gt 0 ]] && command -v python3 > /dev/null; then
+  qmp_dir=$(mktemp -d) || exit 1
+  args+=(-qmp "unix:$qmp_dir/qmp.sock,server=on,wait=off")
+  python3 - "$qmp_dir/qmp.sock" "$iso_keypress_seconds" <<'EOF' > /dev/null 2>&1 &
+import json, os, socket, sys, time
+path, seconds = sys.argv[1], float(sys.argv[2])
+deadline = time.time() + 15
+while not os.path.exists(path):          # wait for QEMU to open the socket
+    if time.time() > deadline:
+        sys.exit(0)
+    time.sleep(0.1)
+s = socket.socket(socket.AF_UNIX)
+s.connect(path)
+f = s.makefile("rw")
+f.readline()                              # QMP greeting
+def qmp(cmd, **arguments):
+    f.write(json.dumps({"execute": cmd, "arguments": arguments}) + "\n")
+    f.flush()
+    while True:                           # skip async events until the reply
+        line = f.readline()
+        if not line:
+            sys.exit(0)                   # QEMU exited
+        reply = json.loads(line)
+        if "return" in reply or "error" in reply:
+            return
+qmp("qmp_capabilities")
+end = time.time() + seconds
+while time.time() < end:
+    qmp("send-key", keys=[{"type": "qcode", "data": "ret"}])
+    time.sleep(0.5)
+EOF
+  keypress_pid=$!
+fi
+
 # Run QEMU, then print the exact command line used
 qemu-system-x86_64 "${args[@]}"
 status=$?
+if [[ -n $qmp_dir ]]; then
+  kill "$keypress_pid" 2> /dev/null
+  rm -rf "$qmp_dir"
+fi
 printf "\nqemu-system-x86_64"
 for a in "${args[@]}"; do
   if [[ $a =~ ^[A-Za-z0-9_./:,=+@-]+$ ]]; then
